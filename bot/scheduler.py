@@ -14,16 +14,17 @@ logger = logging.getLogger(__name__)
 
 
 async def _send_follow_up_batch(bot: Bot) -> None:
-    """Находим пользователей, у которых прошло >= FOLLOW_UP_DELAY_SECONDS с 3-го урока
-    и которым ещё не слали дожим. Шлём, помечаем."""
+    """Шлём дожим тем, кто получил 3-й урок, но не нажал «Хочу на курс»
+    за FOLLOW_UP_DELAY_SECONDS. lessons_watched == 2 означает «урок 3 отправлен,
+    CTA не нажат». follow_up_sent_at IS NULL — дожим ещё не уходил."""
     threshold = datetime.now(timezone.utc) - timedelta(seconds=settings.follow_up_delay_seconds)
 
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(
-                User.lessons_watched == 3,
-                User.lesson3_watched_at.is_not(None),
-                User.lesson3_watched_at <= threshold,
+                User.lessons_watched == 2,
+                User.lesson3_sent_at.is_not(None),
+                User.lesson3_sent_at <= threshold,
                 User.follow_up_sent_at.is_(None),
             )
         )
