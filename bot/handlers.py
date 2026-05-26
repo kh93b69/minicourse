@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import content
@@ -13,6 +14,8 @@ router = Router()
 
 WATCHED_CALLBACK_PREFIX = "watched"
 CTA_CALLBACK = "cta:course"
+
+MESSAGE_CHAR_LIMIT = 3500  # запас до telegram-лимита 4096
 
 
 def watched_keyboard(lesson_number: int) -> InlineKeyboardMarkup:
@@ -162,3 +165,102 @@ async def on_cta(callback: CallbackQuery, bot: Bot) -> None:
         content.CTA_ACCEPTED_TEXT.format(site_url=settings.site_url),
         disable_web_page_preview=False,
     )
+
+
+# ──────────────────────────────── admin commands ─────────────────────────────
+
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in settings.admin_ids
+
+
+def _format_user_status(u: User) -> str:
+    if u.lessons_watched == 0:
+        return "не начал"
+    if u.lessons_watched == 1:
+        return "урок 1"
+    if u.lessons_watched == 2:
+        return "урок 2, ⏰ дожим" if u.follow_up_sent_at else "урок 2"
+    return "урок 3, 🔥 CTA"
+
+
+def _format_user_line(idx: int, u: User) -> str:
+    who = f"@{u.username}" if u.username else "—"
+    return f"{idx}. {who} <code>{u.tg_id}</code> — {_format_user_status(u)}"
+
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    """Возвращает Telegram ID отправителю. Публичная команда — нужна для того,
+    чтобы будущие админы узнали свой ID."""
+    uname = f"@{message.from_user.username}" if message.from_user.username else "—"
+    await message.answer(
+        f"Твой Telegram ID: <code>{message.from_user.id}</code>\n"
+        f"Username: {uname}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return  # тихо игнорируем не-админов
+
+    async with async_session_maker() as session:
+        total = (await session.execute(select(func.count(User.tg_id)))).scalar_one()
+        l1 = (await session.execute(
+            select(func.count(User.tg_id)).where(User.lessons_watched >= 1)
+        )).scalar_one()
+        l2 = (await session.execute(
+            select(func.count(User.tg_id)).where(User.lessons_watched >= 2)
+        )).scalar_one()
+        cta = (await session.execute(
+            select(func.count(User.tg_id)).where(User.lessons_watched == 3)
+        )).scalar_one()
+        auto_follow_up = (await session.execute(
+            select(func.count(User.tg_id)).where(
+                User.lessons_watched == 2,
+                User.follow_up_sent_at.is_not(None),
+            )
+        )).scalar_one()
+
+    got_link = cta + auto_follow_up
+    overall_conv = (got_link / total * 100) if total else 0.0
+    cta_conv = (cta / l2 * 100) if l2 else 0.0
+
+    text = (
+        "📊 <b>Статистика курса</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>\n"
+        f"🎬 Посмотрели урок 1: <b>{l1}</b>\n"
+        f"🎬 Посмотрели урок 2: <b>{l2}</b> (значит получили урок 3)\n"
+        f"🔥 Нажали «Хочу на курс»: <b>{cta}</b>\n"
+        f"⏰ Получили автоматический дожим: <b>{auto_follow_up}</b>\n\n"
+        f"📈 Конверсия в ссылку (CTA + дожим): <b>{got_link} / {total}</b> ({overall_conv:.1f}%)\n"
+        f"📈 CTA-конверсия (от получивших урок 3): <b>{cta} / {l2}</b> ({cta_conv:.1f}%)"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+
+    async with async_session_maker() as session:
+        result = await session.execute(select(User).order_by(User.created_at.desc()))
+        users = result.scalars().all()
+
+    if not users:
+        await message.answer("Пока никого нет.")
+        return
+
+    header = f"👥 <b>Все пользователи ({len(users)}):</b>\n\n"
+    current = header
+    for idx, u in enumerate(users, 1):
+        line = _format_user_line(idx, u) + "\n"
+        if len(current) + len(line) > MESSAGE_CHAR_LIMIT:
+            await message.answer(current, parse_mode="HTML")
+            current = ""
+        current += line
+    if current:
+        await message.answer(current, parse_mode="HTML")

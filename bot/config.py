@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     database_url: str = Field("sqlite+aiosqlite:///./bot.db", alias="DATABASE_URL")
     follow_up_check_interval: int = Field(60, alias="FOLLOW_UP_CHECK_INTERVAL")
     follow_up_delay_seconds: int = Field(86400, alias="FOLLOW_UP_DELAY_SECONDS")
+    # Telegram user IDs, которым разрешены /stats и /users. Через запятую.
+    admin_ids: list[int] = Field(default_factory=list, alias="ADMIN_IDS")
 
     @field_validator("database_url")
     @classmethod
@@ -19,6 +21,16 @@ class Settings(BaseSettings):
             return "postgresql+asyncpg://" + v[len("postgres://"):]
         if v.startswith("postgresql://") and "+asyncpg" not in v:
             return "postgresql+asyncpg://" + v[len("postgresql://"):]
+        return v
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def parse_admin_ids(cls, v):
+        # Принимаем "123,456" или "123" из env как list[int]
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [int(x.strip()) for x in v.split(",") if x.strip()]
         return v
 
 
