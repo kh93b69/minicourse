@@ -1,6 +1,10 @@
+import asyncio
+import logging
+import time
 from datetime import datetime, timezone
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
@@ -10,12 +14,20 @@ from bot import content
 from bot.config import settings
 from bot.db import User, async_session_maker
 
+logger = logging.getLogger(__name__)
+
 router = Router()
 
 WATCHED_CALLBACK_PREFIX = "watched"
 CTA_CALLBACK = "cta:course"
+BROADCAST_CONFIRM = "bc:ok"
+BROADCAST_CANCEL = "bc:no"
 
 MESSAGE_CHAR_LIMIT = 3500  # запас до telegram-лимита 4096
+
+# Pending broadcasts: admin_tg_id → {chat_id, message_id} исходного сообщения.
+# Хранится в памяти: при рестарте сервиса теряется, но admin просто перевызывает /broadcast.
+_pending_broadcasts: dict[int, dict[str, int]] = {}
 
 
 def watched_keyboard(lesson_number: int) -> InlineKeyboardMarkup:
@@ -264,3 +276,163 @@ async def cmd_users(message: Message) -> None:
         current += line
     if current:
         await message.answer(current, parse_mode="HTML")
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message) -> None:
+    """Двух-шаговая рассылка: ответь этой командой на сообщение, которое нужно
+    разослать. Бот покажет превью и кнопку подтверждения."""
+    if not _is_admin(message.from_user.id):
+        return
+
+    replied = message.reply_to_message
+    if replied is None:
+        await message.answer(
+            "Чтобы запустить рассылку, ответь этой командой <b>на сообщение</b>, "
+            "которое нужно разослать.\n\n"
+            "Можно слать любой тип: текст, фото с подписью, видео, кружок и т.д.",
+            parse_mode="HTML",
+        )
+        return
+
+    async with async_session_maker() as session:
+        total = (await session.execute(select(func.count(User.tg_id)))).scalar_one()
+
+    if total == 0:
+        await message.answer("Получателей пока нет — никто ещё не запустил бота.")
+        return
+
+    _pending_broadcasts[message.from_user.id] = {
+        "chat_id": message.chat.id,
+        "message_id": replied.message_id,
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Разослать ({total})", callback_data=BROADCAST_CONFIRM),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=BROADCAST_CANCEL),
+    ]])
+    await message.reply(
+        f"Готов разослать сообщение выше <b>{total}</b> пользователям.\n"
+        "Проверь — и подтверди.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == BROADCAST_CANCEL)
+async def on_broadcast_cancel(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _pending_broadcasts.pop(callback.from_user.id, None)
+    try:
+        await callback.message.edit_text("Рассылка отменена.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == BROADCAST_CONFIRM)
+async def on_broadcast_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    pending = _pending_broadcasts.pop(callback.from_user.id, None)
+    if pending is None:
+        try:
+            await callback.message.edit_text(
+                "Состояние рассылки потеряно (возможно, бот перезагружался). "
+                "Запусти /broadcast заново."
+            )
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    # снимаем кнопки, чтобы не было повторного нажатия
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Стартую…")
+
+    asyncio.create_task(
+        _run_broadcast(
+            bot,
+            admin_chat_id=callback.message.chat.id,
+            src_chat_id=pending["chat_id"],
+            src_message_id=pending["message_id"],
+        )
+    )
+
+
+async def _run_broadcast(
+    bot: Bot, admin_chat_id: int, src_chat_id: int, src_message_id: int
+) -> None:
+    """Копирует сообщение всем пользователям из БД с ограничением ~25 msg/sec
+    и отчётом о прогрессе в чат админу."""
+    async with async_session_maker() as session:
+        result = await session.execute(select(User.tg_id))
+        user_ids: list[int] = [row[0] for row in result.all()]
+
+    total = len(user_ids)
+    sent = 0
+    blocked = 0
+    failed = 0
+
+    progress_msg = await bot.send_message(
+        admin_chat_id, f"📤 Рассылка стартовала: 0/{total}…"
+    )
+    last_edit = 0.0
+
+    for idx, uid in enumerate(user_ids, 1):
+        try:
+            await bot.copy_message(
+                chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            blocked += 1
+        except TelegramRetryAfter as e:
+            # FloodWait — пауза, потом одна повторная попытка
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.copy_message(
+                    chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            logger.exception("Broadcast failed for user %s", uid)
+            failed += 1
+
+        await asyncio.sleep(0.04)  # ~25 msg/sec — безопасно под лимит Telegram (~30/sec)
+
+        # Обновляем прогресс не чаще чем раз в 2 секунды + финальный апдейт
+        now = time.monotonic()
+        if now - last_edit >= 2 or idx == total:
+            try:
+                await progress_msg.edit_text(
+                    f"📤 Рассылка: <b>{idx}/{total}</b>\n"
+                    f"✅ Доставлено: {sent}\n"
+                    f"🚫 Заблокировали бота: {blocked}\n"
+                    f"⚠️ Ошибок: {failed}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            last_edit = now
+
+    try:
+        await progress_msg.edit_text(
+            "📤 <b>Рассылка завершена</b>\n\n"
+            f"Всего получателей: <b>{total}</b>\n"
+            f"✅ Доставлено: <b>{sent}</b>\n"
+            f"🚫 Заблокировали бота: <b>{blocked}</b>\n"
+            f"⚠️ Ошибок: <b>{failed}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
